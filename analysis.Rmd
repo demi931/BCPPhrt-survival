@@ -1,0 +1,307 @@
+---
+title: "Hormone replacement therapy and survival in female bladder cancer patients (BCPP)"
+author: "Xiaoman Jin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    self_contained: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+<!--
+Project hrt-survival of the BCPP repository. This file is the only analysis
+file for this project. It is based on Xiaoman's R script (BCPP_final10.27.R)
+and her Rmd of 2026-10-19, but starts from the shared BCPP cleaning
+(R/build_bcpp_base.R) and the raw files via config/config.R, so that no
+hand-made intermediate files are needed. Knit it from the RStudio project
+(BCPP.Rproj) so that here::here() finds the repository root.
+
+Differences with Xiaoman's version, see the README of this project:
+* the cohort is built from the raw files (no merged_final10.27.xlsx);
+* missing values are real NA, not the text "NA";
+* tumour size and tumour number are compared as numbers;
+* every Cox model and Kaplan-Meier table is produced in one run, for all
+  women and for NMIBC and MIBC, so nothing has to be switched by hand;
+* the Model 2 results table of the MIBC DFS analysis uses Model 2.
+-->
+
+# Packages and shared data
+
+```{r packages}
+library(dplyr)
+library(readr)
+library(survival)
+library(survminer)
+library(rms)
+library(knitr)
+```
+
+```{r shared-data}
+# Shared cleaning for all BCPP papers (see docs/04_cleaning_decisions.md).
+# Result: `bcpp_base`, one row per participant, no rows dropped. Times are in years.
+source(here::here("R", "build_bcpp_base.R"))
+```
+
+# Cohort
+
+Women with bladder cancer and known HRT status (`52_hrt` is 1 = yes or 2 = no;
+0, 3 = unknown, 99 and missing are left out).
+
+```{r cohort}
+meds <- read_csv(find_data_file("q1_medications.csv", bcpp_data_dir),
+                 show_col_types = FALSE) %>%
+  transmute(unique_id,
+            hrt_raw  = `52_hrt`,
+            pill_raw = `52_contraceptive_pill`)
+
+hist_q1 <- read_csv(find_data_file("q1_medical_history.csv", bcpp_data_dir),
+                    show_col_types = FALSE) %>%
+  transmute(unique_id,
+            successful_pregnancies,
+            not_stopped_menstruation = `not stopped menstruation`)
+
+women <- bcpp_base %>%
+  filter(Gender == "female", bladder_ca == "Yes") %>%
+  left_join(meds,    by = "unique_id") %>%
+  left_join(hist_q1, by = "unique_id")
+
+flow <- tibble(
+  step = c("Women with bladder cancer",
+           "Known HRT status (analysis cohort)"),
+  n    = c(nrow(women), sum(women$hrt_raw %in% c(1, 2)))
+)
+kable(flow)
+
+d <- women %>%
+  filter(hrt_raw %in% c(1, 2)) %>%
+  transmute(
+    unique_id,
+    age_at_recruit,
+    Ethnicity,
+    X52_hrt = factor(ifelse(hrt_raw == 1, "Yes", "No"), levels = c("No", "Yes")),
+    X52_contraceptive_pill = factor(pill_raw, levels = c(1, 2), labels = c("Yes", "No")),
+    X21_currently_smoke = factor(
+      recode(as.character(smoke_status), Current = "Yes", Former = "Used to", Never = "Never"),
+      levels = c("Yes", "Used to", "Never")),
+    grade,
+    grade_grouped = factor(
+      case_when(grade %in% c("Grade_1", "Grade_2") ~ "Grade_1+2",
+                grade == "Grade_3"                 ~ "Grade_3"),
+      levels = c("Grade_1+2", "Grade_3")),
+    stage, stage_group = as.character(stage_group),
+    TNM_Nodes, TNM_Mets,
+    number_tumours, size_largest_tumour,
+    size_cat = factor(case_when(size_largest_tumour <  3 ~ "<3",
+                                size_largest_tumour >= 3 ~ ">=3"),
+                      levels = c("<3", ">=3")),
+    cat_tumournumber = factor(case_when(number_tumours <  2 ~ "<2",
+                                        number_tumours >= 2 ~ ">=2"),
+                              levels = c("<2", ">=2")),
+    # successful_pregnancies: 88, 99 and 999 = unknown
+    successful_pregnancy_binary = case_when(
+      successful_pregnancies %in% c(88, 99, 999) ~ NA_character_,
+      successful_pregnancies >  0 ~ "Had successful pregnancy",
+      successful_pregnancies == 0 ~ "No successful pregnancy"),
+    not_stopped_menstruation,
+    # Overall survival: death from any cause (time in years from the survival file)
+    # The shared cleaning converts days to years with 365; Xiaoman's OS times use 365.25.
+    # The 365.25 is kept so that the medians and 5-year rates of the manuscript do not change
+    # (differences are at most 0.006 years).
+    time_to_overall_survival = time_to_overall_survival * 365 / 365.25,
+    Mortality_status_numeric = event,
+    # Disease-free survival: death or recurrence/progression (recurrence_with_progression,
+    # defined by Birmingham), time in years
+    DFSstatus = if_else(event == 1 | recurrence_with_progression %in% 1, 1, 0),
+    time_rwp  = time_to_recurrence_with_progression / 365,
+    DFStimeyears = if_else(DFSstatus == 1,
+                           coalesce(time_rwp, time_to_overall_survival),
+                           pmin(time_rwp, time_to_overall_survival, na.rm = TRUE))
+  )
+
+stopifnot(nrow(d) == 239, sum(d$X52_hrt == "Yes") == 70)
+table(HRT = d$X52_hrt, useNA = "ifany")
+```
+
+# Table 1: baseline characteristics by HRT use
+
+Counts are n (%) of all women (Total) and within the HRT and non-HRT groups. Where a row
+"Unknown" is shown, the test includes it as a category (grade, parity, contraceptive
+pill, tumour number); stage, nodes, metastasis, tumour size and ethnicity are tested on
+known values only.
+
+```{r table1-helpers}
+# n (%) of a categorical variable: Total, HRT, Non-HRT (unknown shown as "Unknown")
+cat_table <- function(x, label) {
+  x <- addNA(factor(x), ifany = TRUE)
+  levels(x)[is.na(levels(x))] <- "Unknown"
+  tab <- table(x, d$X52_hrt)
+  pct <- function(n, N) sprintf("%d (%.2f)", n, 100 * n / N)
+  data.frame(
+    Variable = label, Level = rownames(tab),
+    Total    = mapply(pct, rowSums(tab), nrow(d)),
+    HRT      = mapply(pct, tab[, "Yes"], sum(d$X52_hrt == "Yes")),
+    `Non-HRT`= mapply(pct, tab[, "No"],  sum(d$X52_hrt == "No")),
+    check.names = FALSE, row.names = NULL)
+}
+p_fmt <- function(p) ifelse(p < 0.001, "<0.001", sprintf("%.3f", p))
+```
+
+```{r table1}
+# Age
+age_row <- d %>% group_by(X52_hrt) %>%
+  summarise(n = n(), median = median(age_at_recruit), Q1 = quantile(age_at_recruit, .25),
+            Q3 = quantile(age_at_recruit, .75), mean = mean(age_at_recruit), sd = sd(age_at_recruit))
+age_all <- c(median = median(d$age_at_recruit), Q1 = quantile(d$age_at_recruit, .25)[[1]],
+             Q3 = quantile(d$age_at_recruit, .75)[[1]])
+kable(age_row, digits = 2, caption = "Age at diagnosis, by HRT use")
+cat(sprintf("All women: median %.2f (IQR %.2f-%.2f)\n", age_all[1], age_all[2], age_all[3]))
+shapiro.test(d$age_at_recruit)
+wilcox.test(age_at_recruit ~ X52_hrt, data = d)
+
+# Tests, in the order of the manuscript
+chisq_p  <- function(...) suppressWarnings(chisq.test(table(...)))$p.value
+fisher_p <- function(...) fisher.test(table(...))$p.value
+unk <- function(x) { x <- addNA(factor(x), ifany = TRUE); x }   # unknown as a category
+
+nodes_group <- case_when(d$TNM_Nodes == "N0" ~ "No metastasis",
+                         d$TNM_Nodes %in% c("N1", "N2") ~ "Metastasis")
+
+table1 <- bind_rows(
+  cbind(cat_table(d$Ethnicity,  "Ethnicity"),   P = p_fmt(fisher_p(d$Ethnicity, d$X52_hrt))),
+  cbind(cat_table(d$X21_currently_smoke, "Smoking"), P = p_fmt(chisq_p(d$X21_currently_smoke, d$X52_hrt))),
+  cbind(cat_table(ifelse(d$not_stopped_menstruation, "No", "Yes"), "Menopause"),
+        P = p_fmt(fisher_p(d$not_stopped_menstruation, d$X52_hrt))),
+  cbind(cat_table(d$successful_pregnancy_binary, "Parity"),
+        P = p_fmt(chisq_p(unk(d$successful_pregnancy_binary), d$X52_hrt))),
+  cbind(cat_table(d$X52_contraceptive_pill, "Contraceptive pill"),
+        P = p_fmt(chisq_p(unk(d$X52_contraceptive_pill), d$X52_hrt))),
+  cbind(cat_table(d$stage_group, "Cancer type"), P = p_fmt(chisq_p(d$stage_group, d$X52_hrt))),
+  cbind(cat_table(d$TNM_Nodes,   "Nodes (N)"),  P = p_fmt(fisher_p(nodes_group, d$X52_hrt))),
+  cbind(cat_table(d$TNM_Mets,    "Metastasis (M)"), P = p_fmt(fisher_p(d$TNM_Mets, d$X52_hrt))),
+  cbind(cat_table(d$grade,       "Grade"),      P = p_fmt(chisq_p(unk(d$grade), d$X52_hrt))),
+  cbind(cat_table(d$size_cat,    "Tumour size (cm)"), P = p_fmt(chisq_p(d$size_cat, d$X52_hrt))),
+  cbind(cat_table(d$cat_tumournumber, "Tumour numbers"),
+        P = p_fmt(chisq_p(d$cat_tumournumber, d$X52_hrt)))
+)
+kable(table1, caption = "Table 1 (the P value is shown on every row of a variable)")
+```
+
+# Kaplan-Meier analysis
+
+```{r km-functions}
+strata <- list(All = d, NMIBC = filter(d, stage_group %in% "NMIBC"),
+               MIBC = filter(d, stage_group %in% "MIBC"))
+
+km_table <- function(data, time, event, label) {
+  f   <- as.formula(sprintf("Surv(%s, %s) ~ X52_hrt", time, event))
+  fit <- survfit(f, data = data)
+  tb  <- summary(fit)$table
+  s5  <- summary(fit, times = 5, extend = TRUE)
+  p   <- 1 - pchisq(survdiff(f, data = data)$chisq, 1)
+  data.frame(Analysis = label, HRT = c("No", "Yes"),
+             N = tb[, "records"], Events = tb[, "events"],
+             Median = round(tb[, "median"], 2), Median_lcl = round(tb[, "0.95LCL"], 2),
+             Median_ucl = round(tb[, "0.95UCL"], 2),
+             Surv5y_pct = round(100 * s5$surv, 2), Surv5y_lcl = round(s5$lower, 2),
+             Surv5y_ucl = round(s5$upper, 2), Logrank_p = round(p, 3), row.names = NULL)
+}
+```
+
+```{r km-tables}
+km_all <- bind_rows(
+  lapply(names(strata), function(s) {
+    bind_rows(km_table(strata[[s]], "time_to_overall_survival", "Mortality_status_numeric", paste(s, "OS")),
+              km_table(strata[[s]], "DFStimeyears", "DFSstatus", paste(s, "DFS")))
+  }))
+kable(km_all, caption = "Kaplan-Meier: events, median and 5-year survival (Tables S2-S7)")
+```
+
+```{r km-plots, fig.width=7, fig.height=6}
+for (s in names(strata)) {
+  for (end in c("OS", "DFS")) {
+    tm <- if (end == "OS") "time_to_overall_survival" else "DFStimeyears"
+    ev <- if (end == "OS") "Mortality_status_numeric" else "DFSstatus"
+    f  <- as.formula(sprintf("Surv(%s, %s) ~ X52_hrt", tm, ev))
+    fit <- surv_fit(f, data = strata[[s]])
+    print(ggsurvplot(fit, data = strata[[s]], pval = TRUE, conf.int = TRUE,
+                     risk.table = TRUE, legend.title = "HRT use", palette = "Set1",
+                     title = paste(end, "-", s),
+                     xlab = if (end == "OS") "Time to death (years)" else "Time to events (years)",
+                     ylab = if (end == "OS") "Overall survival probability" else "DFS probability"))
+  }
+}
+```
+
+# Cox regression
+
+Model 1: HRT, smoking, age (restricted cubic spline, 3 knots) and contraceptive pill.
+Model 2: Model 1 plus tumour grade (1+2 versus 3) and, in the analysis of all women,
+cancer type (NMIBC/MIBC). The models use complete cases.
+
+```{r cox}
+cox_models <- function(data, time, event, stratified) {
+  data <- as.data.frame(data)
+  dd <<- datadist(data); options(datadist = "dd")
+  base <- sprintf("Surv(%s, %s) ~ X52_hrt + X21_currently_smoke + rcs(age_at_recruit, 3) + X52_contraceptive_pill",
+                  time, event)
+  add2 <- if (stratified) " + grade_grouped" else " + grade_grouped + stage_group"
+  lapply(c(`Model 1` = base, `Model 2` = paste0(base, add2)), function(fm) {
+    cph(as.formula(fm), data = data, x = TRUE, y = TRUE, surv = TRUE)
+  })
+}
+hrt_row <- function(mod, label) {
+  b <- coef(mod)[["X52_hrt=Yes"]]; se <- sqrt(vcov(mod)["X52_hrt=Yes", "X52_hrt=Yes"])
+  data.frame(Analysis = label, N = mod$stats[["Obs"]], Events = mod$stats[["Events"]],
+             HR = sprintf("%.2f (%.2f-%.2f)", exp(b), exp(b - 1.96 * se), exp(b + 1.96 * se)),
+             P = round(2 * pnorm(-abs(b / se)), 3),
+             PH_global_p = round(cox.zph(mod)$table["GLOBAL", "p"], 3), row.names = NULL)
+}
+
+cox_fits <- list()
+for (s in names(strata)) {
+  for (end in c("OS", "DFS")) {
+    tm <- if (end == "OS") "time_to_overall_survival" else "DFStimeyears"
+    ev <- if (end == "OS") "Mortality_status_numeric" else "DFSstatus"
+    cox_fits[[paste(s, end)]] <- cox_models(strata[[s]], tm, ev, stratified = s != "All")
+  }
+}
+cox_table <- bind_rows(lapply(names(cox_fits), function(k) {
+  bind_rows(lapply(names(cox_fits[[k]]), function(m) hrt_row(cox_fits[[k]][[m]], paste(k, m))))
+}))
+kable(cox_table, caption = "HRT versus no HRT: hazard ratios (Tables 2 and 3) and global proportional hazards test")
+```
+
+## Full output of the models
+
+```{r cox-full}
+for (k in names(cox_fits)) for (m in names(cox_fits[[k]])) {
+  cat("\n=====", k, m, "=====\n")
+  print(cox_fits[[k]][[m]])
+}
+```
+
+## Multicollinearity (VIF), Model 2 in all women
+
+```{r vif}
+round(vif(cox_fits[["All OS"]][["Model 2"]]), 2)
+```
+
+The two age spline terms are expected to be correlated with each other; the other
+covariates have VIF below 2.
+
+```{r write-summary, include=FALSE}
+# Aggregated results (no participant data) for the output folder
+out <- here::here("projects", "hrt-survival", "output", "results_summary.md")
+writeLines(c("# HRT survival: results summary", "",
+             "Generated by `scripts/analysis.Rmd`. Aggregated results only.", "",
+             "## Table 1", "", knitr::kable(table1, format = "pipe"), "",
+             "## Kaplan-Meier (Tables S2-S7)", "", knitr::kable(km_all, format = "pipe"), "",
+             "## Cox regression (Tables 2 and 3)", "", knitr::kable(cox_table, format = "pipe")), out)
+```
